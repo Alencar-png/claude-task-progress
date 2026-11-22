@@ -17,7 +17,7 @@ shows `Concluída em …` for 45 seconds.
 ## Steps and background work
 
 When the task has a plan or something runs in the background, the band shows a **Ver etapas**
-button (hotkey `e` while the band has the focus). It opens a pane with:
+button. It opens a pane with:
 
 - each step of the plan, marked done (`✓`), in progress (`›`) or pending (`·`);
 - each subagent and each background command, with its own progress bar and time estimate.
@@ -107,8 +107,8 @@ marketplace** com `Alencar-png/claude-task-progress` e depois **Add plugin**.
 
 ### Etapas e segundo plano
 
-Quando a tarefa tem um plano ou algo roda em segundo plano, a faixa mostra o botão **Ver etapas**
-(atalho `e` com a faixa em foco). Ele abre um painel com cada etapa do plano e, para cada subagente
+Quando a tarefa tem um plano ou algo roda em segundo plano, a faixa mostra o botão **Ver etapas**.
+Ele abre um painel com cada etapa do plano e, para cada subagente
 e cada comando em segundo plano, uma barra de progresso própria com a estimativa de tempo.
 
 ### De onde vem a estimativa

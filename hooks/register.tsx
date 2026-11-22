@@ -600,8 +600,11 @@ export const register: Register = on => {
     // Só a tarefa concluída de verdade enche a barra; interrompida ou em pausa fica onde estava.
     const fraction = isComplete ? 1 : fractionOf(task)
     const left = isDone ? null : remainingOf(task, now, history)
-    const steps = task.total > 0 ? ` · ${task.done}/${task.total} etapas` : ''
-    const percent = fraction === null ? '' : ` · ${Math.round(fraction * 100)}%`
+    // Etapas e percentual aparecem uma vez só, à direita da barra; o rótulo é só o que se faz.
+    const figures = [
+      task.total > 0 ? `${task.done}/${task.total} etapas` : '',
+      fraction === null ? '' : `${Math.round(fraction * 100)}%`,
+    ].filter(part => part !== '').join(' · ')
     const what = task.label === '' ? task.title : task.label
     const estimate = left === null ? 'estimando…' : `faltam ${about(left.ms)} (${left.basis})`
     const behind = running > 0 ? ` · ${running} em segundo plano` : ''
@@ -614,19 +617,20 @@ export const register: Register = on => {
           : `${clock(elapsed)} decorridos · ${estimate}${behind}`
 
     return (
-      <Box flexDirection="column">
+      <Box flexDirection="column" gap="sm" paddingY="xs">
         <Progress
-          label={`${what}${percent}${steps}`}
+          label={what}
           value={fraction ?? undefined}
           max={1}
+          valueText={figures === '' ? undefined : figures}
         />
-        <Box flexDirection="row" gap={1}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap="md">
           <Text dimColor>{tail}</Text>
           {(task.total > 0 || jobs.length > 0) && (
             <Button
               key="steps"
               label="Ver etapas"
-              hotkey="e"
+              variant="secondary"
               onPress={() => $.ui.open({ id: PANE, title: PANE_TITLE, closeOnEscape: true })}
             />
           )}
@@ -649,9 +653,9 @@ export const register: Register = on => {
     }
 
     return (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap="lg" padding="sm">
         {task !== null && (
-          <Box flexDirection="column">
+          <Box flexDirection="column" gap="xs">
             <Text bold>{task.title}</Text>
             {task.total === 0 && <Text dimColor>Sem plano de etapas nesta tarefa.</Text>}
             {task.steps.map((step, i) => (
@@ -661,7 +665,7 @@ export const register: Register = on => {
             ))}
           </Box>
         )}
-        <Box flexDirection="column" gap={1}>
+        <Box flexDirection="column" gap="md">
           <Text bold>Em segundo plano</Text>
           {jobs.length === 0 && <Text dimColor>Nada rodando em segundo plano.</Text>}
           {jobs.map(job => {
@@ -678,15 +682,16 @@ export const register: Register = on => {
                     ? `interrompido após ${clock(end - job.startedAt)}`
                     : `${clock(end - job.startedAt)} decorridos · ${left === null ? 'estimando…' : `faltam ${about(left)}`}`
             const plan = job.total > 0 ? ` · ${job.done}/${job.total} etapas` : ''
+            const figures = fraction === null ? undefined : `${Math.round(fraction * 100)}%`
             const tools = job.kind === 'agent' && job.tools > 0 ? ` · ${job.tools} ferramentas` : ''
 
             return (
-              <Box key={`job-${job.id}`} flexDirection="column">
+              <Box key={`job-${job.id}`} flexDirection="column" gap="xs">
                 <Progress
                   label={`${kind}: ${job.title}`}
                   value={fraction ?? undefined}
                   max={1}
-                  valueText={fraction === null ? undefined : `${Math.round(fraction * 100)}%`}
+                  valueText={figures}
                 />
                 <Text dimColor>
                   {state}

@@ -1,6 +1,6 @@
 {
   "name": "task-progress",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Barra de progresso e estimativa de tempo, em tempo real, para cada tarefa passada ao Claude",
   "author": { "name": "Guilherme Alencar" },
   "license": "MIT",
