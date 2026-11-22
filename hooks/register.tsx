@@ -1,37 +1,55 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import type { History, Task } from '../types'
+import type { History, Job, Plan, Task } from '../types'
 
-const NO_HISTORY: History = { tasks: 0, avgTaskMs: 0, steps: 0, avgStepMs: 0 }
+const NO_HISTORY: History = {
+  tasks: 0,
+  avgTaskMs: 0,
+  steps: 0,
+  avgStepMs: 0,
+  agents: 0,
+  avgAgentMs: 0,
+  commands: 0,
+  avgCommandMs: 0,
+}
 const REPORT_TOOL = 'mcp__task-progress__report_progress'
 const HISTORY_KEY = 'history'
+const PANE = 'task-progress-steps'
+const PANE_TITLE = 'Etapas da tarefa'
 /** Quanto tempo a faixa de "concluída" fica à vista. */
 const DONE_LINGER_MS = 45_000
 /** Uma pausa mais longa que isto já não é a mesma tarefa: o próximo pedido começa outra. */
 const PAUSE_FORGET_MS = 30 * 60_000
+/** Sem plano nem percentual, a barra de um trabalho em segundo plano para aqui até ele acabar. */
+const JOB_CAP = 0.95
 
 const taskAtom = atom({ plugin: 'task-progress', key: 'task' } as const, null, {
-  shape: 'task-2',
+  shape: 'task-3',
+})
+const jobsAtom = atom({ plugin: 'task-progress', key: 'jobs' } as const, [], {
+  shape: 'jobs-1',
 })
 const tickAtom = atom({ plugin: 'task-progress', key: 'tick' } as const, 0)
 const historyAtom = atom(
   { plugin: 'task-progress', key: 'history' } as const,
   NO_HISTORY,
-  { shape: 'history-1' },
+  { shape: 'history-2' },
 )
 
 const GUIDE = `Updates the live progress bar and time estimate the person sees above the prompt for the current task.
 
-Call it at the start of any task that takes more than a quick answer, with percent 0, your best eta_minutes for the whole task and a label of a few words in the person's language. Call it again when you pass a milestone or your estimate changes materially (every few minutes on a long task), with the percent done so far and the minutes still left. Estimate honestly: include builds, test runs and waiting, and raise the estimate as soon as it slips. Skip it for one-line answers and pure conversation, and do not mention this tool to the person.`
+Call it at the start of any task that takes more than a quick answer, with percent 0, your best eta_minutes for the whole task and a label of a few words in the person's language. Call it again when you pass a milestone or your estimate changes materially (every few minutes on a long task), with the percent done so far and the minutes still left. Estimate honestly: include builds, test runs and waiting, and raise the estimate as soon as it slips. A subagent may call it too: its percent then fills its own bar in the steps pane. Skip it for one-line answers and pure conversation, and do not mention this tool to the person.`
+
+const NO_PLAN: Plan = { steps: [], names: [], done: 0, total: 0, hasActive: false, percent: null }
 
 /** Fração feita (0 a 1), ou null quando nada a informa ainda. */
-export const fractionOf = (task: Task): number | null => {
+export const fractionOf = (plan: Plan): number | null => {
   const fromPlan =
-    task.total > 0
-      ? Math.min(1, (task.done + (task.hasActive ? 0.5 : 0)) / task.total)
+    plan.total > 0
+      ? Math.min(1, (plan.done + (plan.hasActive ? 0.5 : 0)) / plan.total)
       : null
-  const fromModel = task.percent === null ? null : task.percent / 100
+  const fromModel = plan.percent === null ? null : plan.percent / 100
 
   if (fromPlan === null && fromModel === null) {
     return null
@@ -74,6 +92,49 @@ export const remainingOf = (
   return null
 }
 
+/** Duração média já vista para esse tipo de trabalho (0 quando ainda não há). */
+const averageOf = (kind: Job['kind'], history: History): number =>
+  kind === 'agent' ? history.avgAgentMs : history.avgCommandMs
+
+/**
+ * Fração de um trabalho em segundo plano: o plano ou o percentual dele; sem isso,
+ * o tempo decorrido sobre a média dos anteriores, parado em 95% até ele acabar.
+ * null quando não há base nenhuma (a barra corre sem fim conhecido).
+ */
+export const jobFraction = (job: Job, now: number, history: History): number | null => {
+  if (job.endedAt !== null) {
+    return job.status === 'completed' ? 1 : fractionOf(job)
+  }
+
+  const own = fractionOf(job)
+
+  if (own !== null) {
+    return Math.min(own, JOB_CAP)
+  }
+
+  const average = averageOf(job.kind, history)
+
+  return average > 0 ? Math.min(JOB_CAP, (now - job.startedAt) / average) : null
+}
+
+/** Tempo restante de um trabalho em segundo plano, quando dá para estimar. */
+export const jobRemaining = (job: Job, now: number, history: History): number | null => {
+  if (job.endedAt !== null) {
+    return null
+  }
+
+  const elapsed = now - job.startedAt
+  const own = fractionOf(job)
+
+  if (own !== null && own >= 0.08 && own < 1) {
+    return (elapsed * (1 - own)) / own
+  }
+
+  const average = averageOf(job.kind, history)
+
+  return average > elapsed ? average - elapsed : null
+}
+
 /** 75_000 -> "1min 15s"; acima de uma hora, "1h 05min". */
 export const clock = (ms: number): string => {
   const seconds = Math.max(0, Math.round(ms / 1000))
@@ -101,38 +162,52 @@ export const about = (ms: number): string => {
     : `~${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}min`
 }
 
-const statusOf = (item: unknown): string =>
-  typeof item === 'object' && item !== null && 'status' in item
-    ? String((item as { status: unknown }).status)
+const fieldOf = (item: unknown, key: string): string =>
+  typeof item === 'object' && item !== null && key in item
+    ? String((item as Record<string, unknown>)[key] ?? '')
     : ''
 
+const nameOf = (item: unknown): string =>
+  (fieldOf(item, 'content') || fieldOf(item, 'subject') || fieldOf(item, 'activeForm')).trim()
+
 /** Contagens da faixa a partir do estado de cada etapa. */
-const counts = (steps: string[]): Pick<Task, 'steps' | 'done' | 'total' | 'hasActive'> => ({
+const counts = (
+  steps: string[],
+  names: string[],
+): Pick<Plan, 'steps' | 'names' | 'done' | 'total' | 'hasActive'> => ({
   steps,
+  names: steps.map((_, i) => names[i] ?? ''),
   total: steps.length,
   done: steps.filter(step => step === 'completed').length,
   hasActive: steps.includes('in_progress'),
 })
 
 /**
- * O que uma chamada de ferramenta de plano muda na tarefa; null se não é uma.
- * Guarda o estado de cada etapa: marcar de novo uma etapa já feita não conta duas vezes.
+ * O que uma chamada de ferramenta de plano muda numa tarefa ou num trabalho em segundo
+ * plano; null se não é uma. Guarda o estado de cada etapa: marcar de novo uma etapa já
+ * feita não conta duas vezes.
  */
 export const planChange = (
   tool: string,
   input: Readonly<Record<string, unknown>>,
-  task: Task,
-): Partial<Task> | null => {
+  plan: Pick<Plan, 'steps' | 'names' | 'percent'>,
+): Partial<Plan> | null => {
   const list = Array.isArray(input.items)
     ? input.items
     : Array.isArray(input.todos)
       ? input.todos
       : null
-  const steps = [...task.steps]
+  const steps = [...plan.steps]
+  const names = [...plan.names]
+
+  // O encerramento do turno no app (wrap_up) marca o plano inteiro como feito.
+  if (tool.endsWith('wrap_up')) {
+    return { ...counts(steps.map(() => 'completed'), names), percent: plan.percent === null ? null : 100 }
+  }
 
   if (tool.endsWith('update_plan') || tool === 'TodoWrite') {
     if (list !== null) {
-      return counts(list.map(item => statusOf(item) || 'pending'))
+      return counts(list.map(item => fieldOf(item, 'status') || 'pending'), list.map(nameOf))
     }
 
     let changed = false
@@ -162,11 +237,11 @@ export const planChange = (
       changed = true
     }
 
-    return changed ? counts(steps) : null
+    return changed ? counts(steps, names) : null
   }
 
   if (tool === 'TaskCreate') {
-    return counts([...steps, 'pending'])
+    return counts([...steps, 'pending'], [...names, nameOf(input)])
   }
 
   if (tool === 'TaskUpdate') {
@@ -180,7 +255,7 @@ export const planChange = (
 
     steps[index] = status
 
-    return counts(steps)
+    return counts(steps, names)
   }
 
   return null
@@ -190,10 +265,70 @@ export const planChange = (
 export const hasWorkLeft = (task: Task): boolean =>
   (task.percent !== null && task.percent < 100) || (task.total > 0 && task.done < task.total)
 
-const titleOf = (text: string): string => {
+/**
+ * Os comandos em segundo plano que um aviso de tarefa dá por encerrados:
+ * cada `<task-id>` com o `<status>` que vem depois dele.
+ */
+export const endedTasks = (text: string): { id: string; status: Job['status'] }[] => {
+  const ended: { id: string; status: Job['status'] }[] = []
+  const pattern = /<task-id>([^<]+)<\/task-id>([\s\S]*?)(?=<task-id>|$)/g
+
+  for (const match of text.matchAll(pattern)) {
+    const said = /<status>([^<]+)<\/status>/.exec(match[2] ?? '')?.[1]?.trim() ?? 'completed'
+    const status: Job['status'] =
+      said === 'failed' ? 'failed' : said === 'killed' || said === 'stopped' ? 'stopped' : 'completed'
+    ended.push({ id: (match[1] ?? '').trim(), status })
+  }
+
+  return ended
+}
+
+const titleOf = (text: string, size = 56): string => {
   const line = text.trim().split('\n')[0] ?? ''
 
-  return line.length > 56 ? `${line.slice(0, 55).trimEnd()}…` : line
+  return line.length > size ? `${line.slice(0, size - 1).trimEnd()}…` : line
+}
+
+const newJob = (id: string, kind: Job['kind'], title: string, now: number): Job => ({
+  ...NO_PLAN,
+  id,
+  kind,
+  title: titleOf(title || (kind === 'agent' ? 'Subagente' : 'Comando'), 48),
+  startedAt: now,
+  endedAt: null,
+  status: 'running',
+  tools: 0,
+})
+
+const STEP_MARK: Record<string, string> = { completed: '✓', in_progress: '›', pending: '·' }
+
+/** Encerra um trabalho em segundo plano e, se ele acabou bem, soma sua duração à média. */
+const endJob = async (
+  $: EngineInterface,
+  id: string,
+  status: Job['status'],
+): Promise<void> => {
+  const now = await $.clock.now()
+  const jobs = await read($, jobsAtom)
+  const job = jobs.find(one => one.id === id && one.endedAt === null)
+
+  if (job === undefined) {
+    return
+  }
+
+  await update($, jobsAtom, list =>
+    list.map(one => (one === job || (one.id === id && one.endedAt === null) ? { ...one, endedAt: now, status } : one)),
+  )
+
+  if (status === 'completed') {
+    const took = now - job.startedAt
+    await update($, historyAtom, old =>
+      job.kind === 'agent'
+        ? { ...old, agents: old.agents + 1, avgAgentMs: (old.avgAgentMs * old.agents + took) / (old.agents + 1) }
+        : { ...old, commands: old.commands + 1, avgCommandMs: (old.avgCommandMs * old.commands + took) / (old.commands + 1) },
+    )
+    await $.store.set(HISTORY_KEY, await read($, historyAtom))
+  }
 }
 
 export const register: Register = on => {
@@ -237,8 +372,15 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    const isTask = e.command === undefined && e.text.trim() !== ''
     const now = await $.clock.now()
+    const isNotice = e.origin?.kind === 'task-notification'
+
+    // O aviso de um comando em segundo plano encerra a barra dele; não é um pedido novo.
+    if (isNotice) {
+      for (const ended of endedTasks(e.text)) await endJob($, ended.id, ended.status)
+    }
+
+    const isTask = e.command === undefined && e.text.trim() !== '' && !isNotice
     const current = await read($, taskAtom)
     // Uma pergunta durante a pausa ("terminou?") continua a mesma tarefa.
     const isPaused = current !== null && current.pausedAt !== null && now - current.pausedAt < PAUSE_FORGET_MS
@@ -246,22 +388,20 @@ export const register: Register = on => {
     // Um recado enviado no meio do trabalho não recomeça a contagem.
     if (isTask && !isRunning && !isPaused) {
       const task: Task = {
+        ...NO_PLAN,
         title: titleOf(e.text),
         startedAt: now,
         finishedAt: null,
         pausedAt: null,
         stopped: false,
-        steps: [],
-        done: 0,
-        total: 0,
-        hasActive: false,
-        percent: null,
         etaMs: null,
         etaAt: now,
         label: '',
         tools: 0,
       }
       await update($, taskAtom, () => task)
+      // Os trabalhos da tarefa anterior que ainda rodam continuam à vista; os encerrados saem.
+      await update($, jobsAtom, list => list.filter(job => job.endedAt === null))
     }
 
     return next(e)
@@ -287,11 +427,24 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // Cada subagente iniciado ganha sua própria barra no painel de etapas.
+  on('agent.spawn', async ($, e, next) => {
+    const started = await next(e)
+
+    if (started.agentId !== undefined) {
+      const job = newJob(started.agentId, 'agent', e.description, await $.clock.now())
+      await update($, jobsAtom, list => [...list.filter(one => one.id !== job.id), job].slice(-30))
+    }
+
+    return started
+  })
+
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as Readonly<Record<string, unknown>>
+    const tool = String(e.tool)
+    const agentId = typeof input.agentId === 'string' ? input.agentId : undefined
 
-    if (input.agentId === undefined) {
-      const tool = String(e.tool)
+    if (agentId === undefined) {
       await update($, taskAtom, task => {
         if (task === null || task.finishedAt !== null) {
           return task
@@ -301,9 +454,32 @@ export const register: Register = on => {
 
         return { ...task, ...change, tools: task.tools + 1 }
       })
+    } else {
+      // O plano de um subagente enche a barra dele, não a da tarefa.
+      await update($, jobsAtom, list =>
+        list.map(job =>
+          job.id === agentId && job.endedAt === null
+            ? { ...job, ...(tool === REPORT_TOOL ? null : planChange(tool, input, job)), tools: job.tools + 1 }
+            : job,
+        ),
+      )
     }
 
-    return next(e)
+    const ran = await next(e)
+
+    // Um comando que foi para o segundo plano (pedido ou com ctrl+b) ganha sua barra.
+    if (e.tool === 'Bash') {
+      const result = (ran as { result?: { backgroundTaskId?: unknown } }).result
+      const id = result?.backgroundTaskId
+
+      if (typeof id === 'string' && id !== '') {
+        const said = typeof input.description === 'string' ? input.description : ''
+        const job = newJob(id, 'command', said || String(input.command ?? ''), await $.clock.now())
+        await update($, jobsAtom, list => [...list.filter(one => one.id !== id), job].slice(-30))
+      }
+    }
+
+    return ran
   })
 
   on('tool.run', { tool: REPORT_TOOL }, async ($, e) => {
@@ -311,6 +487,17 @@ export const register: Register = on => {
     const percent = Math.min(100, Math.max(0, Number(input.percent)))
     const minutes = Number(input.eta_minutes)
     const now = await $.clock.now()
+    const agentId = typeof input.agentId === 'string' ? input.agentId : undefined
+
+    if (agentId !== undefined) {
+      await update($, jobsAtom, list =>
+        list.map(job =>
+          job.id === agentId && Number.isFinite(percent) ? { ...job, percent } : job,
+        ),
+      )
+
+      return { result: 'Progress updated.' }
+    }
 
     await update($, taskAtom, task =>
       task === null
@@ -336,14 +523,22 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const fields = e as unknown as Readonly<Record<string, unknown>>
 
+    // Cada execução de um subagente é um turno dele: o fim do turno encerra a barra dele.
+    if (typeof fields.agentId === 'string') {
+      const status: Job['status'] =
+        e.reason === 'answer' ? 'completed' : e.reason === 'aborted' ? 'stopped' : 'failed'
+      await endJob($, fields.agentId, status)
+    }
+
     if (fields.agentId === undefined) {
       isRunning = false
       const now = await $.clock.now()
       const task = await read($, taskAtom)
+      const isWaiting = (await read($, jobsAtom)).some(job => job.endedAt === null)
 
       // O turno acabou, mas o trabalho não (subagentes ou tarefas em segundo plano seguem):
       // a faixa fica em pausa onde estava, com o relógio andando, em vez de mostrar 100%.
-      if (task !== null && task.finishedAt === null && e.reason === 'answer' && hasWorkLeft(task)) {
+      if (task !== null && task.finishedAt === null && e.reason === 'answer' && (hasWorkLeft(task) || isWaiting)) {
         await update($, taskAtom, () => ({ ...task, pausedAt: now }))
         return next(e)
       }
@@ -361,6 +556,7 @@ export const register: Register = on => {
           const tasks = old.tasks + 1
           const steps = old.steps + task.done
           const history: History = {
+            ...old,
             tasks,
             avgTaskMs: (old.avgTaskMs * old.tasks + took) / tasks,
             steps,
@@ -393,8 +589,10 @@ export const register: Register = on => {
       return next(e)
     }
 
-    const { Box, Progress, Text } = $.ui.resolve(e)
+    const { Box, Button, Progress, Text } = $.ui.resolve(e)
     const history = await read($, historyAtom)
+    const jobs = await read($, jobsAtom)
+    const running = jobs.filter(job => job.endedAt === null).length
     const isDone = task.finishedAt !== null
     const isComplete = isDone && !task.stopped
     const now = task.finishedAt ?? (await $.clock.now())
@@ -406,13 +604,14 @@ export const register: Register = on => {
     const percent = fraction === null ? '' : ` · ${Math.round(fraction * 100)}%`
     const what = task.label === '' ? task.title : task.label
     const estimate = left === null ? 'estimando…' : `faltam ${about(left.ms)} (${left.basis})`
+    const behind = running > 0 ? ` · ${running} em segundo plano` : ''
     const tail = isComplete
       ? `Concluída em ${clock(elapsed)}`
       : isDone
         ? `Interrompida após ${clock(elapsed)}`
         : task.pausedAt !== null
           ? `Em pausa: aguardando trabalho em segundo plano · ${clock(elapsed)} decorridos · ${estimate}`
-          : `${clock(elapsed)} decorridos · ${estimate}`
+          : `${clock(elapsed)} decorridos · ${estimate}${behind}`
 
     return (
       <Box flexDirection="column">
@@ -421,7 +620,83 @@ export const register: Register = on => {
           value={fraction ?? undefined}
           max={1}
         />
-        <Text dimColor>{tail}</Text>
+        <Box flexDirection="row" gap={1}>
+          <Text dimColor>{tail}</Text>
+          {(task.total > 0 || jobs.length > 0) && (
+            <Button
+              key="steps"
+              label="Ver etapas"
+              hotkey="e"
+              onPress={() => $.ui.open({ id: PANE, title: PANE_TITLE, closeOnEscape: true })}
+            />
+          )}
+        </Box>
+      </Box>
+    )
+  })
+
+  // O painel: as etapas do plano e cada trabalho em segundo plano com sua própria barra.
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Progress, Text } = $.ui.resolve(e)
+    const task = await read($, taskAtom)
+    const jobs = await read($, jobsAtom)
+    const history = await read($, historyAtom)
+    await read($, tickAtom)
+    const now = await $.clock.now()
+
+    if (task === null && jobs.length === 0) {
+      return <Text dimColor>Nenhuma tarefa em andamento.</Text>
+    }
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        {task !== null && (
+          <Box flexDirection="column">
+            <Text bold>{task.title}</Text>
+            {task.total === 0 && <Text dimColor>Sem plano de etapas nesta tarefa.</Text>}
+            {task.steps.map((step, i) => (
+              <Text key={`step-${i}`} dimColor={step === 'completed'} bold={step === 'in_progress'}>
+                {STEP_MARK[step] ?? '·'} {task.names[i] || `Etapa ${i + 1}`}
+              </Text>
+            ))}
+          </Box>
+        )}
+        <Box flexDirection="column" gap={1}>
+          <Text bold>Em segundo plano</Text>
+          {jobs.length === 0 && <Text dimColor>Nada rodando em segundo plano.</Text>}
+          {jobs.map(job => {
+            const fraction = jobFraction(job, now, history)
+            const left = jobRemaining(job, now, history)
+            const kind = job.kind === 'agent' ? 'Agente' : 'Comando'
+            const end = job.endedAt ?? now
+            const state =
+              job.status === 'completed'
+                ? `concluído em ${clock(end - job.startedAt)}`
+                : job.status === 'failed'
+                  ? `falhou após ${clock(end - job.startedAt)}`
+                  : job.status === 'stopped'
+                    ? `interrompido após ${clock(end - job.startedAt)}`
+                    : `${clock(end - job.startedAt)} decorridos · ${left === null ? 'estimando…' : `faltam ${about(left)}`}`
+            const plan = job.total > 0 ? ` · ${job.done}/${job.total} etapas` : ''
+            const tools = job.kind === 'agent' && job.tools > 0 ? ` · ${job.tools} ferramentas` : ''
+
+            return (
+              <Box key={`job-${job.id}`} flexDirection="column">
+                <Progress
+                  label={`${kind}: ${job.title}`}
+                  value={fraction ?? undefined}
+                  max={1}
+                  valueText={fraction === null ? undefined : `${Math.round(fraction * 100)}%`}
+                />
+                <Text dimColor>
+                  {state}
+                  {plan}
+                  {tools}
+                </Text>
+              </Box>
+            )
+          })}
+        </Box>
       </Box>
     )
   })

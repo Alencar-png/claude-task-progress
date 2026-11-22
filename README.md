@@ -14,6 +14,26 @@ Refatorando os testes · 45% · 3/7 etapas   ████████░░░�
 A band appears above the prompt for each request and updates every second. When the task ends it
 shows `Concluída em …` for 45 seconds.
 
+## Steps and background work
+
+When the task has a plan or something runs in the background, the band shows a **Ver etapas**
+button (hotkey `e` while the band has the focus). It opens a pane with:
+
+- each step of the plan, marked done (`✓`), in progress (`›`) or pending (`·`);
+- each subagent and each background command, with its own progress bar and time estimate.
+
+A job's bar follows its own plan or `report_progress` calls when it has them; otherwise it is the
+time elapsed over the average of earlier jobs of the same kind, held at 95% until the job ends.
+While background work is still running at the end of a turn, the band shows `Em pausa` instead of
+100%.
+
+```
+Agente: Revisar o código                 ██████████░░░░░░  62%
+1min 40s decorridos · faltam ~1 min · 2/4 etapas · 18 ferramentas
+Comando: Testes da Godot                 ████████████████  100%
+concluído em 3min 05s
+```
+
 > The band's text is in Portuguese (`decorridos`, `faltam`, `etapas`). The label of the task
 > follows the language you write in.
 
@@ -48,8 +68,9 @@ The plugin uses the best signal available, in this order:
    sessions.
 
 The line says which one is in use: `estimativa do Claude`, `ritmo atual`, `média por etapa` or
-`média das tarefas`. A message sent in the middle of the work does not restart the count, and
-subagents do not count: only the main turn.
+`média das tarefas`. A message sent in the middle of the work, or a background task's notice, does
+not restart the count. Subagents get their own bars in the steps pane instead of moving the main
+one.
 
 ## Cost and privacy
 
@@ -83,6 +104,12 @@ No prompt de uma sessão do Claude Code no terminal:
 Responda `y` para adicionar o marketplace e escolha o escopo (o de usuário carrega o plugin em
 todas as sessões). No app desktop: **+** ao lado da caixa de mensagem, **Plugins**, **Add
 marketplace** com `Alencar-png/claude-task-progress` e depois **Add plugin**.
+
+### Etapas e segundo plano
+
+Quando a tarefa tem um plano ou algo roda em segundo plano, a faixa mostra o botão **Ver etapas**
+(atalho `e` com a faixa em foco). Ele abre um painel com cada etapa do plano e, para cada subagente
+e cada comando em segundo plano, uma barra de progresso própria com a estimativa de tempo.
 
 ### De onde vem a estimativa
 
