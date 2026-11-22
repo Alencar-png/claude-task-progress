@@ -1,13 +1,16 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { History, Task } from '../types'
-import { about, clock, fractionOf, planChange, remainingOf } from './register'
+import { about, clock, fractionOf, hasWorkLeft, planChange, remainingOf } from './register'
 
 const NONE: History = { tasks: 0, avgTaskMs: 0, steps: 0, avgStepMs: 0 }
 const task = (over: Partial<Task>): Task => ({
   title: 'Corrigir os testes',
   startedAt: 0,
   finishedAt: null,
+  pausedAt: null,
+  stopped: false,
+  steps: [],
   done: 0,
   total: 0,
   hasActive: false,
@@ -58,20 +61,32 @@ test('plan tools of the desktop app and the terminal are both read', async () =>
     { content: 'b', status: 'in_progress' },
     { content: 'c', status: 'pending' },
   ]
-  expect(planChange('mcp__ccd_turn__update_plan', { items }, task({}))).toEqual({
-    total: 3,
-    done: 1,
-    hasActive: true,
-  })
-  expect(
-    planChange('mcp__ccd_turn__update_plan', { advance: true }, task({ done: 1, total: 3 })),
-  ).toEqual({ done: 2, hasActive: true })
-  expect(planChange('TodoWrite', { todos: items }, task({}))).toEqual({
-    total: 3,
-    done: 1,
-    hasActive: true,
-  })
+  const listed = planChange('mcp__ccd_turn__update_plan', { items }, task({}))
+  expect([listed?.total, listed?.done, listed?.hasActive]).toEqual([3, 1, true])
+  const advanced = planChange('mcp__ccd_turn__update_plan', { advance: true }, task({ ...listed }))
+  expect(advanced?.steps).toEqual(['completed', 'completed', 'in_progress'])
+  expect([advanced?.done, advanced?.hasActive]).toEqual([2, true])
+  const todos = planChange('TodoWrite', { todos: items }, task({}))
+  expect([todos?.total, todos?.done]).toEqual([3, 1])
   expect(planChange('Bash', { command: 'ls' }, task({}))).toBe(null)
+})
+
+test('marking a finished step again does not count it twice', async () => {
+  const start = task({ ...planChange('x__update_plan', {
+    items: [{ status: 'completed' }, { status: 'completed' }, { status: 'in_progress' }, { status: 'pending' }],
+  }, task({})) })
+  const again = planChange('x__update_plan', { done: [1, 2], start: 3 }, start)
+  expect([again?.done, again?.total]).toEqual([2, 4])
+  const out = planChange('x__update_plan', { done: [3], start: 4 }, task({ ...again }))
+  expect(out?.steps).toEqual(['completed', 'completed', 'completed', 'in_progress'])
+})
+
+test('a turn that ends with work left pauses instead of showing 100%', async () => {
+  expect(hasWorkLeft(task({ percent: 95 }))).toBe(true)
+  expect(hasWorkLeft(task({ done: 3, total: 4 }))).toBe(true)
+  expect(hasWorkLeft(task({ percent: 100, done: 4, total: 4 }))).toBe(false)
+  // Sem sinal nenhum (resposta curta), o fim do turno é o fim da tarefa.
+  expect(hasWorkLeft(task({}))).toBe(false)
 })
 
 test('times read as a person says them', async () => {

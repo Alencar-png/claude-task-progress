@@ -8,9 +8,11 @@ const REPORT_TOOL = 'mcp__task-progress__report_progress'
 const HISTORY_KEY = 'history'
 /** Quanto tempo a faixa de "concluída" fica à vista. */
 const DONE_LINGER_MS = 45_000
+/** Uma pausa mais longa que isto já não é a mesma tarefa: o próximo pedido começa outra. */
+const PAUSE_FORGET_MS = 30 * 60_000
 
 const taskAtom = atom({ plugin: 'task-progress', key: 'task' } as const, null, {
-  shape: 'task-1',
+  shape: 'task-2',
 })
 const tickAtom = atom({ plugin: 'task-progress', key: 'tick' } as const, 0)
 const historyAtom = atom(
@@ -104,7 +106,18 @@ const statusOf = (item: unknown): string =>
     ? String((item as { status: unknown }).status)
     : ''
 
-/** O que uma chamada de ferramenta de plano muda na tarefa; null se não é uma. */
+/** Contagens da faixa a partir do estado de cada etapa. */
+const counts = (steps: string[]): Pick<Task, 'steps' | 'done' | 'total' | 'hasActive'> => ({
+  steps,
+  total: steps.length,
+  done: steps.filter(step => step === 'completed').length,
+  hasActive: steps.includes('in_progress'),
+})
+
+/**
+ * O que uma chamada de ferramenta de plano muda na tarefa; null se não é uma.
+ * Guarda o estado de cada etapa: marcar de novo uma etapa já feita não conta duas vezes.
+ */
 export const planChange = (
   tool: string,
   input: Readonly<Record<string, unknown>>,
@@ -115,44 +128,67 @@ export const planChange = (
     : Array.isArray(input.todos)
       ? input.todos
       : null
+  const steps = [...task.steps]
 
   if (tool.endsWith('update_plan') || tool === 'TodoWrite') {
     if (list !== null) {
-      return {
-        total: list.length,
-        done: list.filter(item => statusOf(item) === 'completed').length,
-        hasActive: list.some(item => statusOf(item) === 'in_progress'),
+      return counts(list.map(item => statusOf(item) || 'pending'))
+    }
+
+    let changed = false
+    const finish = (index: number): void => {
+      if (index >= 0 && index < steps.length) {
+        steps[index] = 'completed'
+        changed = true
       }
     }
 
-    const marked = Array.isArray(input.done) ? input.done.length : 0
-    const advanced = input.advance === true ? 1 : 0
-
-    if (marked + advanced === 0) {
-      return null
+    if (input.advance === true) {
+      const active = steps.indexOf('in_progress')
+      finish(active)
+      const following = steps.indexOf('pending', Math.max(0, active))
+      if (following >= 0) steps[following] = 'in_progress'
+      changed = true
     }
 
-    const done = Math.min(task.total, task.done + marked + advanced)
+    if (Array.isArray(input.done)) {
+      for (const number of input.done) finish(Number(number) - 1)
+    }
 
-    return { done, hasActive: done < task.total }
+    const start = Number(input.start)
+    if (Number.isInteger(start) && start >= 1 && start <= steps.length) {
+      for (let i = 0; i < steps.length; i += 1) if (steps[i] === 'in_progress') steps[i] = 'pending'
+      steps[start - 1] = 'in_progress'
+      changed = true
+    }
+
+    return changed ? counts(steps) : null
   }
 
   if (tool === 'TaskCreate') {
-    return { total: task.total + 1 }
+    return counts([...steps, 'pending'])
   }
 
   if (tool === 'TaskUpdate') {
     const status = String(input.status ?? '')
+    const active = steps.indexOf('in_progress')
+    const index = active >= 0 ? active : steps.indexOf('pending')
 
-    if (status === 'completed') {
-      return { done: Math.min(task.total, task.done + 1), hasActive: false }
+    if (index < 0 || (status !== 'completed' && status !== 'in_progress')) {
+      return null
     }
 
-    return status === 'in_progress' ? { hasActive: true } : null
+    steps[index] = status
+
+    return counts(steps)
   }
 
   return null
 }
+
+/** Ao fim de um turno, ainda há trabalho? Percentual abaixo de 100 ou etapas pendentes. */
+export const hasWorkLeft = (task: Task): boolean =>
+  (task.percent !== null && task.percent < 100) || (task.total > 0 && task.done < task.total)
 
 const titleOf = (text: string): string => {
   const line = text.trim().split('\n')[0] ?? ''
@@ -202,14 +238,20 @@ export const register: Register = on => {
 
   on('prompt.submit', async ($, e, next) => {
     const isTask = e.command === undefined && e.text.trim() !== ''
+    const now = await $.clock.now()
+    const current = await read($, taskAtom)
+    // Uma pergunta durante a pausa ("terminou?") continua a mesma tarefa.
+    const isPaused = current !== null && current.pausedAt !== null && now - current.pausedAt < PAUSE_FORGET_MS
 
     // Um recado enviado no meio do trabalho não recomeça a contagem.
-    if (isTask && !isRunning) {
-      const now = await $.clock.now()
+    if (isTask && !isRunning && !isPaused) {
       const task: Task = {
         title: titleOf(e.text),
         startedAt: now,
         finishedAt: null,
+        pausedAt: null,
+        stopped: false,
+        steps: [],
         done: 0,
         total: 0,
         hasActive: false,
@@ -234,14 +276,12 @@ export const register: Register = on => {
         void update($, tickAtom, tick => tick + 1)
       })
 
-      // Um turno que continua (sem texto novo) retoma a tarefa que parou.
-      const now = await $.clock.now()
-      await update($, taskAtom, task =>
-        task !== null && task.finishedAt !== null && e.text === ''
-          ? { ...task, finishedAt: null }
-          : task,
-      )
-      void now
+      // A tarefa em pausa continua; um turno sem texto novo também retoma a que acabou de terminar.
+      await update($, taskAtom, task => {
+        if (task === null) return task
+        if (task.pausedAt !== null) return { ...task, pausedAt: null }
+        return task.finishedAt !== null && e.text === '' ? { ...task, finishedAt: null, stopped: false } : task
+      })
     }
 
     return next(e)
@@ -298,14 +338,21 @@ export const register: Register = on => {
 
     if (fields.agentId === undefined) {
       isRunning = false
-      ticker?.cancel()
-      ticker = undefined
-
       const now = await $.clock.now()
       const task = await read($, taskAtom)
 
+      // O turno acabou, mas o trabalho não (subagentes ou tarefas em segundo plano seguem):
+      // a faixa fica em pausa onde estava, com o relógio andando, em vez de mostrar 100%.
+      if (task !== null && task.finishedAt === null && e.reason === 'answer' && hasWorkLeft(task)) {
+        await update($, taskAtom, () => ({ ...task, pausedAt: now }))
+        return next(e)
+      }
+
+      ticker?.cancel()
+      ticker = undefined
+
       if (task !== null && task.finishedAt === null) {
-        await update($, taskAtom, () => ({ ...task, finishedAt: now }))
+        await update($, taskAtom, () => ({ ...task, finishedAt: now, pausedAt: null, stopped: e.reason === 'aborted' }))
 
         // Só respostas completas entram na média; interrupções a distorceriam.
         if (e.reason === 'answer' && now - task.startedAt > 5000) {
@@ -349,18 +396,23 @@ export const register: Register = on => {
     const { Box, Progress, Text } = $.ui.resolve(e)
     const history = await read($, historyAtom)
     const isDone = task.finishedAt !== null
+    const isComplete = isDone && !task.stopped
     const now = task.finishedAt ?? (await $.clock.now())
     const elapsed = now - task.startedAt
-    const fraction = isDone ? 1 : fractionOf(task)
+    // Só a tarefa concluída de verdade enche a barra; interrompida ou em pausa fica onde estava.
+    const fraction = isComplete ? 1 : fractionOf(task)
     const left = isDone ? null : remainingOf(task, now, history)
     const steps = task.total > 0 ? ` · ${task.done}/${task.total} etapas` : ''
     const percent = fraction === null ? '' : ` · ${Math.round(fraction * 100)}%`
     const what = task.label === '' ? task.title : task.label
-    const tail = isDone
+    const estimate = left === null ? 'estimando…' : `faltam ${about(left.ms)} (${left.basis})`
+    const tail = isComplete
       ? `Concluída em ${clock(elapsed)}`
-      : left === null
-        ? `${clock(elapsed)} decorridos · estimando…`
-        : `${clock(elapsed)} decorridos · faltam ${about(left.ms)} (${left.basis})`
+      : isDone
+        ? `Interrompida após ${clock(elapsed)}`
+        : task.pausedAt !== null
+          ? `Em pausa: aguardando trabalho em segundo plano · ${clock(elapsed)} decorridos · ${estimate}`
+          : `${clock(elapsed)} decorridos · ${estimate}`
 
     return (
       <Box flexDirection="column">

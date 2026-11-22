@@ -5,7 +5,13 @@ export type Task = {
   startedAt: number
   /** null enquanto roda. */
   finishedAt: number | null
-  /** Etapas do plano concluídas e no total (0 quando não há plano). */
+  /** O turno acabou mas ainda há trabalho (etapas pendentes ou menos de 100%): em pausa desde. */
+  pausedAt: number | null
+  /** A pessoa interrompeu o turno: a faixa diz "Interrompida", não "Concluída". */
+  stopped: boolean
+  /** Estado de cada etapa do plano, na ordem ("pending", "in_progress", "completed"). */
+  steps: string[]
+  /** Etapas do plano concluídas e no total (0 quando não há plano), derivadas de `steps`. */
   done: number
   total: number
   /** Há uma etapa em andamento: conta como meia etapa feita. */
