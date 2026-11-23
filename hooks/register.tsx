@@ -755,6 +755,7 @@ export const register: Register = on => {
           value={fraction ?? undefined}
           max={1}
           valueText={figures === '' ? undefined : figures}
+          color={isComplete ? 'success' : undefined}
         />
         <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap="md">
           <Text dimColor>{tail}</Text>
