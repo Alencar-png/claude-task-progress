@@ -1,9 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { History, Job, Task } from '../types'
-import { about, clock, endedTasks, fractionOf, hasWorkLeft, jobFraction, planChange, remainingOf } from './register'
+import { about, calibrate, clock, endedTasks, etaFactor, fractionOf, hasWorkLeft, jobFraction, liveFraction, planChange, remainingOf } from './register'
 
-const NONE: History = { tasks: 0, avgTaskMs: 0, steps: 0, avgStepMs: 0, agents: 0, avgAgentMs: 0, commands: 0, avgCommandMs: 0 }
+const NONE: History = { tasks: 0, avgTaskMs: 0, steps: 0, avgStepMs: 0, agents: 0, avgAgentMs: 0, commands: 0, avgCommandMs: 0, etaSamples: 0, etaLogRatio: 0 }
 const task = (over: Partial<Task>): Task => ({
   title: 'Corrigir os testes',
   startedAt: 0,
@@ -20,6 +20,8 @@ const task = (over: Partial<Task>): Task => ({
   etaAt: 0,
   label: '',
   tools: 0,
+  stepAt: 0,
+  claimedMs: null,
   ...over,
 })
 
@@ -31,15 +33,21 @@ test('the plan sets the fraction, an active step counting as half', async () => 
 })
 
 test('the remaining time follows the best signal there is', async () => {
-  // O Claude informou 10 min há 4 min: faltam 6.
-  const told = task({ etaMs: 600_000, etaAt: 60_000, percent: 10 })
+  // O Claude informou 10 min há 4 min, sem percentual: faltam 6.
+  const told = task({ etaMs: 600_000, etaAt: 60_000, percent: 0 })
   expect(remainingOf(told, 300_000, NONE)).toEqual({
     ms: 360_000,
     basis: 'estimativa do Claude',
   })
 
+  // Com percentual, o ritmo de até aquele aviso entra na conta (10% em 1 min: 9 min de
+  // tarefa toda, faltam 5) e as duas contas se misturam entre 5 e 6 min.
+  const mixed = remainingOf(task({ etaMs: 600_000, etaAt: 60_000, percent: 10 }), 300_000, NONE)
+  expect(mixed?.basis).toBe('Claude + ritmo atual')
+  expect((mixed?.ms ?? 0) > 300_000 && (mixed?.ms ?? 0) < 360_000).toBe(true)
+
   // Estimativa vencida: volta ao ritmo atual (25% em 5 min -> faltam 15).
-  const late = task({ etaMs: 60_000, etaAt: 0, done: 1, total: 4 })
+  const late = task({ etaMs: 60_000, etaAt: 0, done: 1, total: 4, stepAt: 300_000 })
   expect(remainingOf(late, 300_000, NONE)).toEqual({
     ms: 900_000,
     basis: 'ritmo atual',
@@ -151,4 +159,44 @@ test('a task notice ends the commands it names', async () => {
     { id: 'b2y', status: 'failed' },
   ])
   expect(endedTasks('nada aqui')).toEqual([])
+})
+
+test('the bar keeps moving between reports instead of freezing', async () => {
+  // 1 de 4 etapas feita em 2 min, a segunda em andamento desde então.
+  const busy = task({ steps: ['completed', 'in_progress', 'pending', 'pending'], done: 1, total: 4, hasActive: true, stepAt: 120_000 })
+  const early = liveFraction(busy, 130_000, NONE) ?? 0
+  const later = liveFraction(busy, 300_000, NONE) ?? 0
+  expect(early > 0.25 && early < 0.3).toBe(true)
+  expect(later > early).toBe(true)
+  // A etapa em andamento nunca chega à próxima sozinha.
+  expect((liveFraction(busy, 10_000_000, NONE) ?? 0) < 0.5).toBe(true)
+
+  // Depois de um percentual dito, a barra anda pelo tempo que falta.
+  const said = task({ percent: 30, etaMs: 300_000, etaAt: 60_000 })
+  const after = liveFraction(said, 210_000, NONE) ?? 0
+  expect(after > 0.5 && after < 0.8).toBe(true)
+  // Nunca 100% antes do fim.
+  expect((liveFraction(task({ percent: 100 }), 0, NONE) ?? 0) < 1).toBe(true)
+})
+
+test('a wild estimate from Claude gives way to the real pace', async () => {
+  // Disse 2 h no começo; em 4 min fez 3 de 4 etapas.
+  const wild = task({ etaMs: 7_200_000, etaAt: 0, steps: ['completed', 'completed', 'completed', 'in_progress'], done: 3, total: 4, hasActive: true, stepAt: 240_000 })
+  const left = remainingOf(wild, 240_000, NONE)
+  expect(left?.basis).toBe('Claude + ritmo atual')
+  expect((left?.ms ?? 0) < 20 * 60_000).toBe(true)
+})
+
+test('estimates are calibrated by how long tasks really took', async () => {
+  expect(etaFactor(NONE)).toBe(1)
+  // Previu 2 h, levou 5 min, três vezes seguidas: a próxima previsão encolhe muito.
+  let seen = NONE
+  for (let i = 0; i < 3; i += 1) seen = { ...seen, ...calibrate(seen, 300_000, 7_200_000) }
+  expect(etaFactor(seen) < 0.15).toBe(true)
+  const told = task({ etaMs: 7_200_000, etaAt: 0 })
+  expect(remainingOf(told, 10_000, seen)?.basis).toBe('estimativa do Claude, ajustada')
+  expect((remainingOf(told, 10_000, seen)?.ms ?? 0) < 20 * 60_000).toBe(true)
+  // Uma tarefa só não manda sozinha.
+  const once = { ...NONE, ...calibrate(NONE, 300_000, 7_200_000) }
+  expect(etaFactor(once) > 0.15).toBe(true)
 })

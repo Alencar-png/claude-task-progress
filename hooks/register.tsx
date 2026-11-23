@@ -12,6 +12,8 @@ const NO_HISTORY: History = {
   avgAgentMs: 0,
   commands: 0,
   avgCommandMs: 0,
+  etaSamples: 0,
+  etaLogRatio: 0,
 }
 const REPORT_TOOL = 'mcp__task-progress__report_progress'
 const HISTORY_KEY = 'history'
@@ -23,9 +25,20 @@ const DONE_LINGER_MS = 45_000
 const PAUSE_FORGET_MS = 30 * 60_000
 /** Sem plano nem percentual, a barra de um trabalho em segundo plano para aqui até ele acabar. */
 const JOB_CAP = 0.95
+/** Enquanto a tarefa roda, a barra nunca passa disto: o 100% é só do fim de verdade. */
+const RUNNING_CAP = 0.97
+/** Uma etapa em andamento enche no máximo esta fração dela antes de ser marcada feita. */
+const STEP_CAP = 0.9
+/** Sem base nenhuma, quanto se supõe que dura uma etapa. */
+const DEFAULT_STEP_MS = 3 * 60_000
+/** A calibração da estimativa do Claude fica entre estes fatores. */
+const MIN_ETA_FACTOR = 0.05
+const MAX_ETA_FACTOR = 3
+/** Quantas tarefas a média da calibração pesa no máximo (as mais novas mandam mais). */
+const ETA_MEMORY = 10
 
 const taskAtom = atom({ plugin: 'task-progress', key: 'task' } as const, null, {
-  shape: 'task-3',
+  shape: 'task-4',
 })
 const jobsAtom = atom({ plugin: 'task-progress', key: 'jobs' } as const, [], {
   shape: 'jobs-1',
@@ -34,12 +47,12 @@ const tickAtom = atom({ plugin: 'task-progress', key: 'tick' } as const, 0)
 const historyAtom = atom(
   { plugin: 'task-progress', key: 'history' } as const,
   NO_HISTORY,
-  { shape: 'history-2' },
+  { shape: 'history-3' },
 )
 
 const GUIDE = `Updates the live progress bar and time estimate the person sees above the prompt for the current task.
 
-Call it at the start of any task that takes more than a quick answer, with percent 0, your best eta_minutes for the whole task and a label of a few words in the person's language. Call it again when you pass a milestone or your estimate changes materially (every few minutes on a long task), with the percent done so far and the minutes still left. Estimate honestly: include builds, test runs and waiting, and raise the estimate as soon as it slips. A subagent may call it too: its percent then fills its own bar in the steps pane. Skip it for one-line answers and pure conversation, and do not mention this tool to the person.`
+Call it at the start of any task that takes more than a quick answer, with percent 0, your best eta_minutes for the whole task and a label of a few words in the person's language. Call it again when you pass a milestone or your estimate changes materially (every few minutes on a long task), with the percent done so far and the minutes still left. Estimate YOUR OWN wall-clock time, not a human developer's: you work far faster than a person, and most tasks you do take 2 to 20 minutes; only count long waits you know of (builds, exports, test runs, slow commands). Revise the estimate up or down as soon as it is off. A subagent may call it too: its percent then fills its own bar in the steps pane. Skip it for one-line answers and pure conversation, and do not mention this tool to the person.`
 
 const NO_PLAN: Plan = { steps: [], names: [], done: 0, total: 0, hasActive: false, percent: null }
 
@@ -58,6 +71,53 @@ export const fractionOf = (plan: Plan): number | null => {
   return Math.max(fromPlan ?? 0, fromModel ?? 0)
 }
 
+const clamp = (value: number, low: number, high: number): number =>
+  Math.min(high, Math.max(low, value))
+
+/**
+ * Quanto multiplicar o tempo que o Claude diz, pelo que as tarefas anteriores mostraram
+ * (duração real sobre a prevista). Uma amostra "neutra" entra na média, para uma tarefa
+ * só não mandar sozinha: 1 quando ainda não há nenhuma.
+ */
+export const etaFactor = (history: History): number =>
+  history.etaSamples > 0
+    ? clamp(
+        Math.exp((history.etaLogRatio * history.etaSamples) / (history.etaSamples + 1)),
+        MIN_ETA_FACTOR,
+        MAX_ETA_FACTOR,
+      )
+    : 1
+
+/** Soma uma tarefa concluída à calibração: duração real sobre a que o Claude previu. */
+export const calibrate = (
+  history: History,
+  realMs: number,
+  claimedMs: number,
+): Pick<History, 'etaSamples' | 'etaLogRatio'> => {
+  const kept = Math.min(history.etaSamples, ETA_MEMORY - 1)
+  const sample = Math.log(clamp(realMs / claimedMs, 0.01, 10))
+
+  return {
+    etaSamples: history.etaSamples + 1,
+    etaLogRatio: (history.etaLogRatio * kept + sample) / (kept + 1),
+  }
+}
+
+/**
+ * Fração firme (só etapas concluídas e o percentual dito, nada suposto pelo tempo) e quando
+ * ela foi informada: o ritmo se mede naquele instante, não com o relógio de agora.
+ */
+const solidFraction = (task: Task): { fraction: number; at: number } | null => {
+  const fromPlan = task.total > 0 ? Math.min(1, task.done / task.total) : null
+  const fromModel = task.percent === null ? null : task.percent / 100
+
+  if (fromModel !== null && (fromPlan === null || fromModel >= fromPlan)) {
+    return { fraction: fromModel, at: task.etaAt }
+  }
+
+  return fromPlan === null ? null : { fraction: fromPlan, at: task.stepAt }
+}
+
 /** Tempo restante e de onde vem a conta; null quando não dá para estimar. */
 export const remainingOf = (
   task: Task,
@@ -65,18 +125,34 @@ export const remainingOf = (
   history: History,
 ): { ms: number; basis: string } | null => {
   const elapsed = now - task.startedAt
-  const fraction = fractionOf(task)
+  const solid = solidFraction(task)
+  const factor = etaFactor(history)
+  const told = task.etaMs === null ? null : task.etaAt + task.etaMs * factor - now
+  // No ritmo de até aquele aviso, a tarefa toda leva (tempo até ele) / fração; falta o resto.
+  const observed = solid === null ? 0 : solid.at - task.startedAt
+  const paceLeft =
+    solid !== null && solid.fraction >= 0.08 && solid.fraction < 1 && observed >= 20_000
+      ? observed / solid.fraction - elapsed
+      : null
+  const pace = paceLeft !== null && paceLeft > 0 ? paceLeft : null
 
-  if (task.etaMs !== null) {
-    const left = task.etaAt + task.etaMs - now
+  // As duas contas juntas, numa média em escala de ordem de grandeza (2 h contra 5 min dá
+  // ~30 min, não ~1 h): quanto mais feito, mais o ritmo real manda.
+  if (told !== null && told > 0 && pace !== null && solid !== null) {
+    const weight = Math.min(0.85, 0.3 + solid.fraction)
 
-    if (left > 0) {
-      return { ms: left, basis: 'estimativa do Claude' }
+    return {
+      ms: Math.exp(weight * Math.log(pace) + (1 - weight) * Math.log(told)),
+      basis: 'Claude + ritmo atual',
     }
   }
 
-  if (fraction !== null && fraction >= 0.08 && fraction < 1) {
-    return { ms: (elapsed * (1 - fraction)) / fraction, basis: 'ritmo atual' }
+  if (told !== null && told > 0) {
+    return { ms: told, basis: factor === 1 ? 'estimativa do Claude' : 'estimativa do Claude, ajustada' }
+  }
+
+  if (pace !== null) {
+    return { ms: pace, basis: 'ritmo atual' }
   }
 
   if (task.total > 0 && history.avgStepMs > 0) {
@@ -90,6 +166,49 @@ export const remainingOf = (
   }
 
   return null
+}
+
+/**
+ * Fração que a barra mostra enquanto a tarefa roda: anda com o tempo entre um aviso e
+ * outro em vez de ficar parada. A etapa em andamento enche aos poucos pelo tempo que as
+ * etapas desta tarefa vêm levando (sem chegar à próxima); depois de um percentual dito, a
+ * barra avança na proporção do tempo passado sobre o tempo passado mais o que falta.
+ * Nunca chega a 100% antes do fim; null quando nada a informa ainda.
+ */
+export const liveFraction = (task: Task, now: number, history: History): number | null => {
+  let fromPlan: number | null = null
+
+  if (task.total > 0) {
+    let step = 0
+
+    if (task.hasActive) {
+      const expected =
+        task.done > 0
+          ? Math.max(30_000, (task.stepAt - task.startedAt) / task.done)
+          : history.avgStepMs > 0
+            ? history.avgStepMs
+            : DEFAULT_STEP_MS
+      step = STEP_CAP * (1 - Math.exp(-Math.max(0, now - task.stepAt) / expected))
+    }
+
+    fromPlan = Math.min(1, (task.done + step) / task.total)
+  }
+
+  let fromModel: number | null = null
+
+  if (task.percent !== null) {
+    const said = task.percent / 100
+    const since = Math.max(0, now - task.etaAt)
+    const left = remainingOf(task, now, history)
+    fromModel =
+      left !== null && said < 1 && since > 0 ? said + (1 - said) * (since / (since + left.ms)) : said
+  }
+
+  if (fromPlan === null && fromModel === null) {
+    return null
+  }
+
+  return Math.min(RUNNING_CAP, Math.max(fromPlan ?? 0, fromModel ?? 0))
 }
 
 /** Duração média já vista para esse tipo de trabalho (0 quando ainda não há). */
@@ -398,6 +517,8 @@ export const register: Register = on => {
         etaAt: now,
         label: '',
         tools: 0,
+        stepAt: now,
+        claimedMs: null,
       }
       await update($, taskAtom, () => task)
       // Os trabalhos da tarefa anterior que ainda rodam continuam à vista; os encerrados saem.
@@ -445,14 +566,19 @@ export const register: Register = on => {
     const agentId = typeof input.agentId === 'string' ? input.agentId : undefined
 
     if (agentId === undefined) {
+      const now = await $.clock.now()
       await update($, taskAtom, task => {
         if (task === null || task.finishedAt !== null) {
           return task
         }
 
         const change = tool === REPORT_TOOL ? null : planChange(tool, input, task)
+        // Uma etapa nova começou quando muda o número de feitas ou a etapa em andamento.
+        const isNewStep =
+          change?.steps !== undefined &&
+          (change.done !== task.done || change.steps.indexOf('in_progress') !== task.steps.indexOf('in_progress'))
 
-        return { ...task, ...change, tools: task.tools + 1 }
+        return { ...task, ...change, stepAt: isNewStep ? now : task.stepAt, tools: task.tools + 1 }
       })
     } else {
       // O plano de um subagente enche a barra dele, não a da tarefa.
@@ -510,6 +636,11 @@ export const register: Register = on => {
                 ? minutes * 60_000
                 : task.etaMs,
             etaAt: now,
+            // A primeira previsão de duração total é a que se compara com a real no fim.
+            claimedMs:
+              task.claimedMs === null && Number.isFinite(minutes) && minutes > 0
+                ? now - task.startedAt + minutes * 60_000
+                : task.claimedMs,
             label:
               typeof input.label === 'string' && input.label.trim() !== ''
                 ? input.label.trim().slice(0, 48)
@@ -564,6 +695,7 @@ export const register: Register = on => {
               task.done > 0 && steps > 0
                 ? (old.avgStepMs * old.steps + took) / steps
                 : old.avgStepMs,
+            ...(task.claimedMs !== null && task.claimedMs > 0 ? calibrate(old, took, task.claimedMs) : null),
           }
           await update($, historyAtom, () => history)
           await $.store.set(HISTORY_KEY, history)
@@ -598,7 +730,7 @@ export const register: Register = on => {
     const now = task.finishedAt ?? (await $.clock.now())
     const elapsed = now - task.startedAt
     // Só a tarefa concluída de verdade enche a barra; interrompida ou em pausa fica onde estava.
-    const fraction = isComplete ? 1 : fractionOf(task)
+    const fraction = isComplete ? 1 : liveFraction(task, now, history)
     const left = isDone ? null : remainingOf(task, now, history)
     // Etapas e percentual aparecem uma vez só, à direita da barra; o rótulo é só o que se faz.
     const figures = [
@@ -623,6 +755,7 @@ export const register: Register = on => {
           value={fraction ?? undefined}
           max={1}
           valueText={figures === '' ? undefined : figures}
+          color={isComplete ? 'success' : undefined}
         />
         <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap="md">
           <Text dimColor>{tail}</Text>
