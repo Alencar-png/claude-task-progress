@@ -67,8 +67,18 @@ The plugin uses the best signal available, in this order:
 3. **History.** The average time per step and per task of your earlier tasks, kept between
    sessions.
 
-The line says which one is in use: `estimativa do Claude`, `ritmo atual`, `média por etapa` or
-`média das tarefas`. A message sent in the middle of the work, or a background task's notice, does
+Claude's estimate is calibrated: at the end of each task the plugin compares the total Claude
+first predicted with how long it really took, and scales later estimates by that (`estimativa do
+Claude, ajustada`). Once steps are done, Claude's estimate and the current pace are blended on a
+log scale, the pace weighing more as the task advances (`Claude + ritmo atual`), so a wild guess
+gives way to what is really happening.
+
+The bar keeps moving between reports: the step in progress fills over the time the earlier steps
+of the task took (never reaching the next one), and after a reported percent the bar advances by
+the time passed over the time passed plus the time left. It stays below 100% until the task ends.
+
+The line says which one is in use: `estimativa do Claude`, `estimativa do Claude, ajustada`,
+`Claude + ritmo atual`, `ritmo atual`, `média por etapa` or `média das tarefas`. A message sent in the middle of the work, or a background task's notice, does
 not restart the count. Subagents get their own bars in the steps pane instead of moving the main
 one.
 
@@ -117,6 +127,11 @@ e cada comando em segundo plano, uma barra de progresso própria com a estimativ
    começo da tarefa e a cada marco, com o percentual feito e os minutos que faltam.
 2. **Ritmo atual.** Etapas concluídas da lista de tarefas contra o tempo decorrido.
 3. **Histórico.** Média por etapa e por tarefa das tarefas anteriores, guardada entre sessões.
+
+A estimativa do Claude é calibrada pelas tarefas anteriores (duração real contra a prevista) e,
+quando já há etapas feitas, misturada com o ritmo atual, que pesa mais à medida que a tarefa
+avança. Entre um aviso e outro a barra continua andando com o tempo, sem chegar a 100% antes do
+fim.
 
 A estimativa do Claude custa uma chamada curta de ferramenta no início e a cada marco. Nenhum dado
 sai da máquina.

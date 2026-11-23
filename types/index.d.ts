@@ -31,6 +31,10 @@ export type Task = Plan & {
   label: string
   /** Chamadas de ferramenta da tarefa. */
   tools: number
+  /** Quando o plano mudou pela última vez: começo da etapa em andamento. */
+  stepAt: number
+  /** Duração total que o Claude previu no primeiro aviso (decorrido + restante), para calibrar. */
+  claimedMs: number | null
 }
 
 /** Um trabalho em segundo plano da tarefa: um subagente ou um comando. */
@@ -59,6 +63,10 @@ export type History = {
   avgAgentMs: number
   commands: number
   avgCommandMs: number
+  /** Quantas previsões do Claude já foram comparadas com a duração real. */
+  etaSamples: number
+  /** Média do logaritmo de (duração real / duração prevista pelo Claude); 0 = acerta. */
+  etaLogRatio: number
 }
 
 declare module 'claude-code' {
